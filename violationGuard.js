@@ -310,7 +310,6 @@ export function createViolationGuard(options = {}) {
 
   const handleKeyDown = event => {
     if (!isDevtoolsShortcut(event)) return false;
-    event.preventDefault();
     reportViolation();
     return true;
   };

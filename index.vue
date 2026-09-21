@@ -56,7 +56,7 @@
 
           <component v-else :is="activeComponent" :key="activeMenu" @open-topology="openTopologyCanvas"
             @change-student="changeReviewStudent" @need-login="needLogin = true" @exam-state-change="handleExamStateChange"
-            @logout="handleExamLogout" @violation="openCodeDialog" @exam-closed="handleExamClosedByStatus" />
+            @logout="handleExamLogout" @violation="showCodeDialog" @exam-closed="handleExamClosedByStatus" />
       </main>
 
       <FloatingScore
@@ -135,7 +135,7 @@
           <el-input v-model="code" type="text" placeholder="请输入验证码"></el-input>
         </el-form-item>
         <div style="display: flex; justify-content: flex-end;">
-          <el-button size="small" type="primary" native-type="submit">确定</el-button>
+          <el-button size="small" type="primary" native-type="submit" :loading="verifyingCode || reportingViolation">确定</el-button>
         </div>
       </el-form>
     </el-dialog>
@@ -185,6 +185,7 @@ import xmXdk from '../../components/xdkModelExam/index.vue';
 import xmpskNew from '../../components/pskModelExam/index.vue';
 import paperManagement from './cpns/PaperManagement.vue';
 import { createViolationGuard } from './violationGuard.js';
+import { examSession } from './examSession';
 import { bindFullscreenChange, enterExamFullscreen, exitExamFullscreen, isExamFullscreen } from './examFullscreen';
 import { finishExam, getExamTime, getPaperDetail, getTempAnswer, logout as logoutRequest, submitExamSession, toPaperView, wgjl, yzmjy } from '@/api/pwgh/examCbPsk';
 
@@ -395,6 +396,9 @@ export default {
       theoryFullscreenGate: !isExaminer && !needLogin && hasTheoryPaper && !isExamFullscreen(),
       enteringTheoryFullscreen: false,
       codeDialog: false,
+      pendingViolation: false,
+      verifyingCode: false,
+      reportingViolation: false,
       code: '',
       showIndex: -1,
       selectTab: '',
@@ -549,8 +553,8 @@ export default {
     isTheoryExamLocked: {
       immediate: true,
       handler(locked) {
-        if(locked) this.bindExamKeyBlock();
-        else this.unbindExamKeyBlock(); 
+        if (locked) this.bindExamKeyBlock();
+        else this.unbindExamKeyBlock();
       }
     },
     searchDetail: {
@@ -604,9 +608,14 @@ export default {
     this.unbindTheoryFullscreen = bindFullscreenChange(this.onTheoryFullscreenChange);
   },
   beforeDestroy() {
+    this._examDisposed = true;
+    this._verificationRequest = null;
+    this._violationRequest = null;
+    this.verifyingCode = false;
+    this.reportingViolation = false;
     this.removeMenuBallDragListeners();
     window.removeEventListener('resize', this.constrainMenuBallPosition);
-    this.unbindExamKeyBlock()
+    this.unbindExamKeyBlock();
     if (this.unbindTheoryFullscreen) this.unbindTheoryFullscreen();
     this.stopTheoryViolationGuard();
     if (this.timer) window.clearInterval(this.timer);
@@ -699,7 +708,6 @@ export default {
         this.stopTheoryViolationGuard();
         this.theoryFullscreenGate = false;
         if (!answering) exitExamFullscreen();
-        if (!answering) this.releaseExamKeyboardLock();
       }
       this.syncTheoryExamLock();
       if (this.scenarioExamActive) {
@@ -720,10 +728,14 @@ export default {
     },
     canWatchTheoryViolation() {
       return !this.needLogin && !this.isExaminer && !this.reviewMode && !this.mode
-        && !this.teacherInfo.id && !this.teacherInfo.userId
         && this.examAnswering && !this.scenarioExamActive;
     },
     startTheoryViolationGuard() {
+      if (this.codeDialog || this.enteringTheoryFullscreen) return;
+      if (this.pendingViolation) {
+        this.showCodeDialog();
+        return;
+      }
       if (!this.canWatchTheoryViolation()) {
         this.stopTheoryViolationGuard();
         return;
@@ -751,11 +763,11 @@ export default {
     onTheoryFullscreenChange() {
       if (!this.canWatchTheoryViolation()) return;
       if (isExamFullscreen()) {
+        if (this.enteringTheoryFullscreen || this.codeDialog) return;
         this.theoryFullscreenGate = false;
         this.startTheoryViolationGuard();
         return;
       }
-      this.releaseExamKeyboardLock();
       if (this.codeDialog) return;
       if (this.violationGuard && this.violationGuard.state && this.violationGuard.state.started) return;
       this.theoryFullscreenGate = true;
@@ -773,40 +785,30 @@ export default {
     },
     enterTheoryFullscreen() {
       if (this.enteringTheoryFullscreen) return;
+      const version = examSession.version;
+      this.stopTheoryViolationGuard({ keepDialog: true });
       this.enteringTheoryFullscreen = true;
-      enterExamFullscreen()
-        .then(() => this.requestExamKeyboardLock())
+      return enterExamFullscreen()
         .then(() => {
+          if (this._examDisposed || version !== examSession.version) return;
           if (!isExamFullscreen()) {
-            this.releaseExamKeyboardLock();
             this.theoryFullscreenGate = true;
-            this.$message.warning('授权期间退出了全屏，键盘锁未生效，请重新进入全屏');
+            this.$message.warning('进入全屏过程中已退出，请重新进入全屏');
             return;
           }
           this.theoryFullscreenGate = false;
-          this.startTheoryViolationGuard();
+          this.enteringTheoryFullscreen = false;
+          if (this.pendingViolation) this.showCodeDialog();
+          else this.startTheoryViolationGuard();
         })
         .catch(error => {
-          this.releaseExamKeyboardLock();
+          if (this._examDisposed || version !== examSession.version) return;
           this.theoryFullscreenGate = true;
           this.$message.warning((error && error.message) || '未能进入全屏，请允许浏览器全屏后重试');
         })
         .finally(() => {
-          this.enteringTheoryFullscreen = false;
+          if (version === examSession.version) this.enteringTheoryFullscreen = false;
         });
-    },
-    requestExamKeyboardLock() {
-      if (!window.navigator.keyboard || typeof window.navigator.keyboard.lock !== 'function') {
-        this.$message.warning('当前浏览器不支持键盘锁（Keyboard Lock），请使用 HTTPS 环境下的 Chrome/Edge');
-        return Promise.resolve();
-      }
-      return window.navigator.keyboard.lock(['Escape', 'F5', 'F11', 'F12'])
-        .catch(error => Promise.reject(new Error(error && error.message ? error.message : '键盘锁请求失败')));
-    },
-    releaseExamKeyboardLock() {
-      if (window.navigator.keyboard && typeof window.navigator.keyboard.unlock === 'function') {
-        window.navigator.keyboard.unlock();
-      }
     },
     stopTheoryViolationGuard(options = {}) {
       window.removeEventListener('keydown', this.onKeyDown);
@@ -832,40 +834,83 @@ export default {
       const value = source && Object.prototype.hasOwnProperty.call(source, 'sfwg') ? source.sfwg : source;
       return value === 1 || value === '1' || value === true;
     },
+    showCodeDialog(waitForFullscreen = true) {
+      if (this.needLogin || this.isExaminer || this.reviewMode || this.mode) return;
+      this.stopTheoryViolationGuard({ keepDialog: true });
+      if (waitForFullscreen && this.isTheoryExamLocked && (!isExamFullscreen() || this.enteringTheoryFullscreen)) {
+        this.pendingViolation = true;
+        this.theoryFullscreenGate = true;
+        return;
+      }
+      this.pendingViolation = false;
+      this.codeDialog = true;
+    },
     openCodeDialog() {
       if (this.needLogin || this.isExaminer || this.reviewMode || this.mode) return;
-      if (this.codeDialog || this._openingCodeDialog) return;
-      this._openingCodeDialog = true;
-      this.codeDialog = true;
-      wgjl().then(res => {
+      if (this.codeDialog || this.pendingViolation || this.reportingViolation) return;
+      const version = examSession.version;
+      const violationVersion = examSession.violationVersion;
+      const request = {};
+      this._violationRequest = request;
+      this.reportingViolation = true;
+      this.showCodeDialog(false);
+      return wgjl().then(res => {
+        if (this._examDisposed || version !== examSession.version || violationVersion !== examSession.violationVersion) return;
         if (res && !res.success && String(res.msg || '').includes('禁止考试')) {
           this.banExamForViolation();
         }
       }).catch(() => {}).finally(() => {
-        this._openingCodeDialog = false;
+        if (this._violationRequest === request) {
+          this._violationRequest = null;
+          this.reportingViolation = false;
+        }
       });
     },
     submitCode() {
+      if (this.verifyingCode || this.reportingViolation) return;
       if (!this.code) {
         this.$message.error('请输入验证码!');
         return;
       }
-      yzmjy({ code: this.code }).then(res => {
+      const version = examSession.version;
+      const request = {};
+      this._verificationRequest = request;
+      this.verifyingCode = true;
+      return yzmjy({ code: this.code }).then(res => {
+        if (this._verificationRequest !== request) return;
+        if (this._examDisposed || version !== examSession.version) {
+          this.$message.warning('考试状态已变化，请重新校验验证码');
+          return;
+        }
         if (res && res.success) {
+          examSession.violationVersion++;
+          this.reportingViolation = false;
+          this.ksInfo.sfwg = 0;
+          this.stopTheoryViolationGuard({ keepDialog: true });
           this.codeDialog = false;
           this.code = '';
           this.$message.success('已解除限制');
-          this.$nextTick(() => {
-            if (this.canWatchTheoryViolation() && !isExamFullscreen()) {
-              this.stopTheoryViolationGuard({ keepDialog: true });
+          return this.$nextTick().then(() => {
+            if (this._examDisposed || version !== examSession.version || !this.canWatchTheoryViolation()) return;
+            if (!isExamFullscreen()) {
               this.theoryFullscreenGate = true;
+              return;
             }
+            this.theoryFullscreenGate = false;
+            this.startTheoryViolationGuard();
           });
         } else {
           this.$message.error((res && res.msg) || '验证码错误');
         }
       }).catch(error => {
+        if (this._examDisposed || version !== examSession.version) return;
         this.$message.error(error.message || '验证失败');
+      }).finally(() => {
+        // 忽略旧会话结果，也要结束该请求的 loading，且不能清掉新请求的 loading。
+        if (this._verificationRequest === request) {
+          this._verificationRequest = null;
+          this.verifyingCode = false;
+        }
       });
     },
     isScenarioExam() {
@@ -994,7 +1039,6 @@ export default {
       this.theoryFullscreenGate = false;
       this.stopTheoryViolationGuard();
       exitExamFullscreen();
-      this.releaseExamKeyboardLock();
       this.$confirm('考试已结束', '提示', {
         type: 'warning',
         confirmButtonText: '确认',
@@ -1006,13 +1050,18 @@ export default {
     getExamTimeInfo(paperId) {
       const id = paperId || localStorage.getItem('paperId');
       if (!id) return;
-      getExamTime({ paperId: id }).then(response => {
-        this.$set(this, 'ksInfo', response.data || {});
+      const version = examSession.version;
+      const violationVersion = examSession.violationVersion;
+      return getExamTime({ paperId: id }).then(response => {
+        if (this._examDisposed || version !== examSession.version) return;
+        const data = { ...(response.data || {}) };
+        if (violationVersion !== examSession.violationVersion) data.sfwg = this.ksInfo.sfwg;
+        this.$set(this, 'ksInfo', data);
         if (this.isActiveStudentExam && this.hasExamEndedStatus(this.ksInfo)) {
           this.handleExamClosedByStatus();
           return;
         }
-        if (this.isActiveStudentExam && this.isViolationLocked(this.ksInfo)) this.openCodeDialog();
+        if (violationVersion === examSession.violationVersion && this.isActiveStudentExam && this.isViolationLocked(this.ksInfo)) this.showCodeDialog();
         if (this.timer) window.clearInterval(this.timer);
         if (this.scenarioExamActive && this.ksInfo.endTime && !this.getTimeDiff) {
           this.handleExamExpired();
@@ -1031,6 +1080,7 @@ export default {
           this.ksInfo.currentTime = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
         }, 1000);
       }).catch(() => {
+        if (this._examDisposed || version !== examSession.version) return;
         if (this.timer) window.clearInterval(this.timer);
         this.timer = null;
       });
@@ -1070,6 +1120,13 @@ export default {
         });
     },
     login(data = {}) {
+      examSession.version++;
+      this.pendingViolation = false;
+      this._verificationRequest = null;
+      this._violationRequest = null;
+      this.reportingViolation = false;
+      this.verifyingCode = false;
+      this.enteringTheoryFullscreen = false;
       const { role, status } = data;
       this.currentUser = readStoredUser();
       this.ksUserInfo = { ...this.currentUser };
@@ -1105,22 +1162,20 @@ export default {
       if (this.violationGuard && this.violationGuard.handleKeyDown(event)) return;
     },
     onExamKeyBlock(event) {
-      const key = String(event.key || '').toLowerCase();
-      if(key === 'escape' || key === 'f5' || key === 'f11'|| key === 'f12') {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        event.stopPropagation();
-      }
+      const key = event.code || event.key;
+      if (key !== 'F5' && key !== 'F12') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
     },
     bindExamKeyBlock() {
-      if(this._examKeyBlockBound) return
-      window.addEventListener('keydown', this.onExamKeyBlock, true)
-      this._examKeyBlockBound = true
+      if (this._examKeyBlockBound) return;
+      window.addEventListener('keydown', this.onExamKeyBlock, true);
+      this._examKeyBlockBound = true;
     },
     unbindExamKeyBlock() {
-      if(!this._examKeyBlockBound) return
-      window.removeEventListener('keydown', this.onExamKeyBlock, true)
-      this._examKeyBlockBound = false
+      if (!this._examKeyBlockBound) return;
+      window.removeEventListener('keydown', this.onExamKeyBlock, true);
+      this._examKeyBlockBound = false;
     },
     nav_click(index, subMenu) {
       if (!subMenu.pop) return;
@@ -1284,6 +1339,13 @@ export default {
       }
     },
     clearLoginState() {
+      examSession.version++;
+      this.pendingViolation = false;
+      this._verificationRequest = null;
+      this._violationRequest = null;
+      this.reportingViolation = false;
+      this.verifyingCode = false;
+      this.enteringTheoryFullscreen = false;
       this.stopExamClock();
       localStorage.removeItem('ks-user-info');
       localStorage.removeItem('ks-user-info-teacher');
@@ -1304,7 +1366,6 @@ export default {
       this.syncTheoryExamLock();
       this.clearExamTimeInfo();
       exitExamFullscreen();
-      this.releaseExamKeyboardLock();
     },
     openTopologyCanvas() {
       if (this.$root && Object.prototype.hasOwnProperty.call(this.$root, 'activeTab')) this.$root.activeTab = 'v10';

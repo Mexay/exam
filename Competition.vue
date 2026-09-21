@@ -153,6 +153,7 @@ import {
   getExamTime
 } from '@/api/pwgh/examCbPsk';
 import { enterExamFullscreen, exitExamFullscreen, isExamFullscreen } from './examFullscreen';
+import { examSession } from './examSession';
 
 export default {
   name: 'ExamCompetition',
@@ -187,8 +188,6 @@ export default {
   },
   beforeDestroy() {
     window.removeEventListener('resize', this.measureScenarioExamName);
-    this.unbindExamKeyBlock();
-    this.releaseExamKeyboardLock();
   },
   async mounted() {
     window.addEventListener('resize', this.measureScenarioExamName);
@@ -220,50 +219,16 @@ export default {
     },
     notifyExamState(answering, exam) {
       if (!answering) {
-        this.unbindExamKeyBlock();
-        this.releaseExamKeyboardLock();
         this.$emit('exam-state-change', { answering: false });
         return;
       }
       const paperType = exam && (exam.paperTypeCode || exam.paperType);
       const scenario = paperType === 'SCENARIO' || paperType === '场景题';
-      if (!scenario) this.bindExamKeyBlock();
       this.$emit('exam-state-change', {
         answering: true,
         scenario,
         paperId: exam && (exam.id || exam.paperId)
       });
-    },
-    onExamKeyBlock(event) {
-      const key = String(event.key || '').toLowerCase();
-      if (key === 'escape' || key === 'f5' || key === 'f11' || key === 'f12') {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        event.stopPropagation();
-      }
-    },
-    requestExamKeyboardLock() {
-      if (!window.navigator.keyboard || typeof window.navigator.keyboard.lock !== 'function') {
-        this.$message.warning('当前浏览器不支持键盘锁（Keyboard Lock），请使用 HTTPS 环境下的 Chrome/Edge');
-        return Promise.resolve();
-      }
-      return window.navigator.keyboard.lock(['Escape', 'F5', 'F11', 'F12'])
-        .catch(error => Promise.reject(new Error(error && error.message ? error.message : '键盘锁请求失败')));
-    },
-    releaseExamKeyboardLock() {
-      if (window.navigator.keyboard && typeof window.navigator.keyboard.unlock === 'function') {
-        window.navigator.keyboard.unlock();
-      }
-    },
-    bindExamKeyBlock() {
-      if (this._examKeyBlockBound) return;
-      window.addEventListener('keydown', this.onExamKeyBlock, true);
-      this._examKeyBlockBound = true;
-    },
-    unbindExamKeyBlock() {
-      if (!this._examKeyBlockBound) return;
-      window.removeEventListener('keydown', this.onExamKeyBlock, true);
-      this._examKeyBlockBound = false;
     },
     restoreActiveScenarioExam() {
       const storedExam = localStorage.getItem('ks-active-paper');
@@ -277,6 +242,7 @@ export default {
       }
     },
     async restoreActiveTheoryExam() {
+      const version = examSession.version;
       if (this.started || localStorage.getItem('ks-active-paper')) {
         this.restoringTheory = false;
         return;
@@ -295,6 +261,7 @@ export default {
           return;
         }
         const response = await getExamSession(paperId);
+        if (this._isDestroyed || version !== examSession.version) return;
         this.examSession = toExamSessionView(response.data, exam);
         if (!this.examSession.questions.length) {
           this.examSession = null;
@@ -302,6 +269,7 @@ export default {
           return;
         }
         this.tempAnswers = await this.loadTempAnswers(this.examSession.paperId || paperId);
+        if (this._isDestroyed || version !== examSession.version) return;
         this.started = true;
         this.notifyExamState(true, { ...exam, ...this.examSession });
       } catch (error) {
@@ -409,16 +377,7 @@ export default {
       return paperType === 'SCENARIO' || paperType === '场景题';
     },
     confirmTheoryFullscreen() {
-      this.bindExamKeyBlock();
-      if (isExamFullscreen()) {
-        return this.requestExamKeyboardLock().then(() => {
-          if (!isExamFullscreen()) {
-            this.releaseExamKeyboardLock();
-            this.$message.warning('授权期间退出了全屏，键盘锁未生效，请重新进入全屏');
-            return Promise.reject(new Error('exit-fullscreen'));
-          }
-        });
-      }
+      if (isExamFullscreen()) return Promise.resolve();
       return this.$msgbox({
         title: '进入考试',
         message: '理论考试需全屏作答。请先进入全屏，再开始考试。考试过程中退出全屏或切换窗口将视为违规。',
@@ -432,20 +391,16 @@ export default {
         confirmButtonLoading: false,
         beforeClose: (action, instance, done) => {
           if (action !== 'confirm') {
-            this.unbindExamKeyBlock();
-            this.releaseExamKeyboardLock();
             instance.confirmButtonLoading = false;
             done();
             return;
           }
           instance.confirmButtonLoading = true;
           enterExamFullscreen()
-            .then(() => this.requestExamKeyboardLock())
             .then(() => {
               if (!isExamFullscreen()) {
-                this.releaseExamKeyboardLock();
                 instance.confirmButtonLoading = false;
-                this.$message.warning('授权期间退出了全屏，键盘锁未生效，请重新进入全屏');
+                this.$message.warning('进入全屏过程中已退出，请重新进入全屏');
                 done('cancel');
                 return;
               }
@@ -460,6 +415,7 @@ export default {
       });
     },
     async startExam(exam) {
+      const version = examSession.version;
       if (this.hasRecordStatus(exam)) {
         this.$message.info('该考试已完成，不能重复参加');
         return;
@@ -468,6 +424,7 @@ export default {
       if (!isScenario) {
         try {
           await this.confirmTheoryFullscreen();
+          if (this._isDestroyed || version !== examSession.version) return;
         } catch (error) {
           return;
         }
@@ -479,7 +436,9 @@ export default {
       this.startingExamId = exam.id;
       let keepFullscreen = isScenario;
       try {
+        const violationVersion = examSession.violationVersion;
         const timeRes = await getExamTime({ paperId: exam.id });
+        if (this._isDestroyed || version !== examSession.version) return;
         if (timeRes && timeRes.success === false) {
           this.$message.error(timeRes.msg || '获取考试时间失败');
           return;
@@ -489,7 +448,7 @@ export default {
           this.$emit('exam-closed');
           return;
         }
-        if (timeData.sfwg === 1 || timeData.sfwg === '1' || timeData.sfwg === true) {
+        if (violationVersion === examSession.violationVersion && (timeData.sfwg === 1 || timeData.sfwg === '1' || timeData.sfwg === true)) {
           this.$emit('violation');
         }
         const { currentTime, startTime, endTime } = timeData;
@@ -514,6 +473,7 @@ export default {
         localStorage.setItem('paperId', exam.id);
         if (!isResume) {
           const startRes = await startExamRequest({ paperId: exam.id });
+          if (this._isDestroyed || version !== examSession.version) return;
           if (startRes && startRes.success === false) {
             this.$message.error(startRes.msg || '开始考试失败');
             if (prevPaperId) localStorage.setItem('paperId', prevPaperId);
@@ -530,22 +490,23 @@ export default {
           return;
         }
         const response = await getExamSession(exam.id);
+        if (this._isDestroyed || version !== examSession.version) return;
         this.examSession = toExamSessionView(response.data, exam);
         if (!this.examSession.questions.length) {
           this.$message.warning('当前试卷暂无题目');
           return;
         }
         this.tempAnswers = await this.loadTempAnswers(this.examSession.paperId);
+        if (this._isDestroyed || version !== examSession.version) return;
         this.started = true;
         this.notifyExamState(true, exam);
         keepFullscreen = true;
       } catch (error) {
+        if (this._isDestroyed || version !== examSession.version) return;
         this.$message.error(error.message || '开始考试失败');
       } finally {
         this.startingExamId = '';
-        if (!isScenario && !keepFullscreen) exitExamFullscreen();
-        if (!isScenario && !keepFullscreen) this.releaseExamKeyboardLock();
-        if (!this.started) this.unbindExamKeyBlock();
+        if (version === examSession.version && !isScenario && !keepFullscreen) exitExamFullscreen();
       }
     },
     async loadTempAnswers(paperId) {

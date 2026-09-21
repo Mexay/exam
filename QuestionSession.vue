@@ -137,6 +137,7 @@
 <script>
 import { compactChoiceAnswer, choiceAnswerKeys, getExamTime } from '@/api/pwgh/examCbPsk';
 import { cloneData } from './mockData';
+import { examSession } from './examSession';
 
 function createRecords(questions) {
   return questions.reduce((result, question) => {
@@ -523,15 +524,19 @@ export default {
         this.startDurationFallback();
         return;
       }
-      getExamTime({ paperId }).then(response => {
-        const data = (response && response.data) || {};
+      const version = examSession.version;
+      const violationVersion = examSession.violationVersion;
+      return getExamTime({ paperId }).then(response => {
+        if (this._isDestroyed || version !== examSession.version) return;
+        const data = { ...((response && response.data) || {}) };
+        if (violationVersion !== examSession.violationVersion) data.sfwg = this.ksInfo.sfwg;
         this.$set(this, 'ksInfo', data);
         if (this.hasExamEndedStatus(data.examStatus)) {
           this.stopTimer();
           this.$emit('exam-closed');
           return;
         }
-        if (this.isViolationLocked(data.sfwg)) this.$emit('violation');
+        if (violationVersion === examSession.violationVersion && this.isViolationLocked(data.sfwg)) this.$emit('violation');
         if (this.timer) window.clearInterval(this.timer);
         if (!this.ksInfo.endTime) {
           this.startDurationFallback();
@@ -547,6 +552,7 @@ export default {
           this.ksInfo.currentTime = this.formatExamClock(nextTime);
         }, 1000);
       }).catch(() => {
+        if (this._isDestroyed || version !== examSession.version) return;
         this.startDurationFallback();
       });
     },
