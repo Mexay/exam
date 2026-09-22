@@ -31,7 +31,7 @@
                    :initial-answers="tempAnswers"
                    :temp-answer-handler="saveTempQuestionAnswer"
                    :submit-handler="submitExamAnswers" @completed="onTheoryExamSubmitted" @exit="exitExam"
-                   @violation="$emit('violation')" @exam-closed="$emit('exam-closed')"/>
+                   @violation="$emit('violation')" @exam-closed="$emit('exam-closed', $event)"/>
   <section v-else class="page-section competition-entry-page">
     <article v-if="examsLoading || restoringTheory" class="surface table-state"><i class="el-icon-loading"></i>{{ restoringTheory ? '正在进入试卷' : '正在加载可参加考试' }}</article>
     <template v-else-if="availableExams.length">
@@ -146,6 +146,7 @@ import {
   submitExamSession,
   saveTempAnswer,
   getTempAnswer,
+  compactChoiceAnswer,
   toExamRecordView,
   toExamSessionView,
   toExamView,
@@ -154,6 +155,7 @@ import {
 } from '@/api/pwgh/examCbPsk';
 import { enterExamFullscreen, exitExamFullscreen, isExamFullscreen } from './examFullscreen';
 import { examSession } from './examSession';
+import { assertExamCanSubmit } from './examSubmission';
 
 export default {
   name: 'ExamCompetition',
@@ -310,9 +312,13 @@ export default {
       }
     },
     finishKs() {
-      this.$confirm('确定要提交试卷吗？提交后将结束考试，是否继续？', '提示', {type: 'warning'})
-          .then(() => {
-            finishExam().then(res => {
+      const version = examSession.version;
+      return this.$confirm('确定要提交试卷吗？提交后将结束考试，是否继续？', '提示', {type: 'warning'})
+          .then(async () => {
+            const paperId = this.scenarioExam && (this.scenarioExam.id || this.scenarioExam.paperId);
+            await assertExamCanSubmit(paperId || localStorage.getItem('paperId'));
+            if (this._isDestroyed || version !== examSession.version) return;
+            return finishExam().then(res => {
               if (res && res.success === false) {
                 this.$message.error(res.msg || '提交失败');
                 return;
@@ -329,6 +335,11 @@ export default {
             });
           })
           .catch(error => {
+            if (this._isDestroyed || version !== examSession.version) return;
+            if (error.code === 'EXAM_UNAVAILABLE') {
+              this.$emit('exam-closed', error.message);
+              return;
+            }
             if (error !== 'cancel' && error !== 'close') this.$message.error(error.message || '提交失败');
           });
     },
@@ -521,14 +532,53 @@ export default {
     async saveTempQuestionAnswer({ questionId, answer }) {
       const paperId = this.examSession && this.examSession.paperId;
       if (!paperId || questionId == null || questionId === '') return;
-      try {
-        await saveTempAnswer({ paperId, questionId, answer });
-      } catch (error) {
-        this.$message.error(error.message || '答案暂存失败');
+      const version = examSession.version;
+      if (this._tempAnswerPaperId !== paperId) {
+        this._tempAnswerPaperId = paperId;
+        this._tempAnswerQueue = Promise.resolve();
+        this._pendingTempAnswers = new Map();
       }
+      const pending = this._pendingTempAnswers;
+      const change = { questionId, answer };
+      const key = String(questionId);
+      pending.set(key, change);
+      const saving = this._tempAnswerQueue.then(async () => {
+        if (this._isDestroyed || version !== examSession.version) throw new Error('考试会话已变化，已取消暂存');
+        const response = await saveTempAnswer({ paperId, questionId, answer });
+        if (response && (response.success === false || (response.code != null && String(response.code) !== '0'))) {
+          throw new Error(response.msg || '答案暂存失败');
+        }
+        if (pending.get(key) === change) pending.delete(key);
+      });
+      // 队列继续处理后续修改，失败的最新答案保留到交卷前重试。
+      this._tempAnswerQueue = saving.catch(() => {});
+      return saving;
     },
     async submitExamAnswers({answers}) {
-      const response = await submitExamSession({paperId: this.examSession.paperId, answers});
+      const version = examSession.version;
+      const paperId = this.examSession.paperId;
+      if (this._tempAnswerPaperId === paperId) {
+        await this._tempAnswerQueue;
+        for (const change of Array.from(this._pendingTempAnswers.values())) {
+          if (this._isDestroyed || version !== examSession.version) throw new Error('考试会话已变化，已取消提交');
+          await this.saveTempQuestionAnswer(change);
+        }
+      }
+      if (this._isDestroyed || version !== examSession.version) throw new Error('考试会话已变化，已取消提交');
+      const saved = await getTempAnswer({ paperId });
+      if (this._isDestroyed || version !== examSession.version) throw new Error('考试会话已变化，已取消提交');
+      if (!saved || saved.success === false || (saved.code != null && String(saved.code) !== '0') || !Array.isArray(saved.data)) {
+        throw new Error((saved && saved.msg) || '读取最新答案失败，请重试交卷');
+      }
+      const latestAnswers = saved.data.map(item => ({
+        questionId: item.questionId || item.id,
+        userAnswer: compactChoiceAnswer(item.userAnswer == null || item.userAnswer === '' ? item.answer : item.userAnswer)
+      })).filter(item => item.userAnswer);
+      const hasLocalAnswers = Array.isArray(answers) && answers.some(item => item.userAnswer != null && String(item.userAnswer).trim() !== '');
+      if (hasLocalAnswers && !latestAnswers.length) throw new Error('未读取到已作答内容，请重试交卷');
+      await assertExamCanSubmit(paperId);
+      if (this._isDestroyed || version !== examSession.version) throw new Error('考试会话已变化，已取消提交');
+      const response = await submitExamSession({paperId, answers: latestAnswers});
       const result = response.data;
       const recordId = result && typeof result === 'object' ? (result.recordId || result.id) : result;
       if (recordId == null || recordId === '') throw new Error(response.msg);

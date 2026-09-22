@@ -28,13 +28,13 @@
           <div v-if="currentQuestion.type === '判断题'" class="judgment-options">
             <button v-for="option in currentQuestion.options" :key="option.key" type="button"
               :class="['judgment-option', optionClass(option.key)]"
-              :disabled="instantFeedback && currentRecord.submitted" @click="toggleAnswer(option.key)">
+              :disabled="submitting || (timed && examExpiredHandled) || (instantFeedback && currentRecord.submitted)" @click="toggleAnswer(option.key)">
               <b>{{ option.key }}</b><span>{{ option.text }}</span>
             </button>
           </div>
           <div v-else-if="currentQuestion.type !== '简答题'" class="learning-options">
             <button v-for="option in currentQuestion.options" :key="option.key" type="button"
-              :class="optionClass(option.key)" :disabled="instantFeedback && currentRecord.submitted"
+              :class="optionClass(option.key)" :disabled="submitting || (timed && examExpiredHandled) || (instantFeedback && currentRecord.submitted)"
               @click="toggleAnswer(option.key)">
               <b>{{ option.key }}</b><span>{{ option.text }}</span><i
                 v-if="instantFeedback && currentRecord.submitted && answerKeys(currentQuestion.answer).includes(option.key)"
@@ -42,7 +42,8 @@
             </button>
           </div>
           <el-input v-else v-model="currentRecord.text" class="learning-text-answer" type="textarea" :rows="6"
-            :disabled="instantFeedback && currentRecord.submitted" placeholder="请输入你的答案"></el-input>
+            :disabled="submitting || (timed && examExpiredHandled) || (instantFeedback && currentRecord.submitted)"
+            @change="saveCurrentAnswer" placeholder="请输入你的答案"></el-input>
           <div v-if="instantFeedback && currentRecord.submitted"
             :class="['practice-feedback', { correct: currentRecord.correct }]">
             <div><i :class="currentRecord.correct ? 'el-icon-circle-check' : 'el-icon-circle-close'"></i><strong>{{
@@ -57,7 +58,7 @@
                 :disabled="!hasAnswer" @click="submitAnswer">提交答案</el-button><el-button v-else size="small" type="primary"
                 :loading="submitting" @click="nextQuestion">{{ currentIndex === questionSet.length - 1 ? '查看结果' : '下一题'
                 }}<i class="el-icon-arrow-right el-icon--right"></i></el-button></template>
-            <el-button size="small" v-else type="primary" :loading="submitting" @click="nextExamQuestion">{{ currentIndex ===
+            <el-button size="small" v-else type="primary" :loading="submitting || savingAnswer" @click="nextExamQuestion">{{ currentIndex ===
               questionSet.length
               - 1 ? '提交试卷' : '下一题' }}<i v-if="currentIndex !== questionSet.length - 1"
                 class="el-icon-arrow-right el-icon--right"></i></el-button>
@@ -227,6 +228,7 @@ export default {
       seconds: 0,
       timer: null,
       submitting: false,
+      savingAnswer: false,
       serverResult: null,
       examExpiredHandled: false,
       ksInfo: {
@@ -361,10 +363,16 @@ export default {
       }));
     },
     toggleAnswer(key) {
+      if (this.submitting || (this.timed && this.examExpiredHandled)) return;
       const record = this.ensureRecord();
       if (this.currentQuestion.type === '多选题') record.answers = record.answers.includes(key) ? record.answers.filter(item => item !== key) : [...record.answers, key];
       else record.answers = [key];
-      this.persistCurrentTempAnswer();
+      this.saveCurrentAnswer();
+    },
+    saveCurrentAnswer() {
+      return this.persistCurrentTempAnswer().catch(error => {
+        this.$message.error(error.message || '答案暂存失败');
+      });
     },
     submitAnswer() {
       const record = this.ensureRecord();
@@ -426,15 +434,21 @@ export default {
     },
     nextQuestion() { if (this.currentIndex === this.questionSet.length - 1) this.finish(); else this.goTo(this.currentIndex + 1); },
     async nextExamQuestion() {
-      if (this.submitting) return;
-      this.submitting = true;
+      if (this.submitting || this.savingAnswer) return;
+      const isLast = this.currentIndex === this.questionSet.length - 1;
+      if (this.examExpiredHandled && !isLast) return;
+      this.savingAnswer = true;
       try {
         await this.persistCurrentTempAnswer();
+      } catch (error) {
+        this.$message.error(error.message || '答案暂存失败');
+        return;
       } finally {
-        this.submitting = false;
+        this.savingAnswer = false;
       }
-      if (this.currentIndex === this.questionSet.length - 1) this.finish();
-      else this.goTo(this.currentIndex + 1);
+      if (this.submitting) return;
+      if (isLast) this.finish();
+      else if (!this.examExpiredHandled) this.goTo(this.currentIndex + 1);
     },
     buildAnswers() {
       return this.questionSet.map(question => ({
@@ -464,7 +478,7 @@ export default {
       });
     },
     async finish() {
-      if (this.submitting) return;
+      if (this.submitting || this.view !== 'session') return;
       if (this.timed && this.view === 'session' && !this.examExpiredHandled) {
         try {
           await this.$confirm('确定要提交试卷吗？提交后将结束考试，是否继续？', '提示', { type: 'warning' });
@@ -472,16 +486,22 @@ export default {
           return;
         }
       }
+      if (this.submitting || this.view !== 'session') return;
       this.stopTimer();
       if (!this.submitHandler) { this.view = 'result'; return; }
       this.submitting = true;
       try {
+        if (this.currentQuestion && this.currentQuestion.type === '简答题') await this.persistCurrentTempAnswer();
         const result = await this.submitHandler({ answers: this.buildAnswers(), questions: this.questionSet });
         this.serverResult = result || null;
         this.applyResultDetails(result && result.details);
         this.view = 'result';
         this.$emit('completed', result);
       } catch (error) {
+        if (error.code === 'EXAM_UNAVAILABLE') {
+          this.$emit('exam-closed', error.message);
+          return;
+        }
         this.$message.error(error.message || '提交失败，请稍后重试');
         if (this.timed && this.formattedTime) this.startTimer();
       } finally { this.submitting = false; }

@@ -26,7 +26,7 @@
 
 <!--          <el-tag v-if="showSubmitAction" type="danger" effect="dark" size="small" class="exam-submit-tag"-->
 <!--            @click="finishKs">提交试卷</el-tag>-->
-          <el-button type="text" icon="el-icon-switch-button" @click="logout">退出登录</el-button>
+          <el-button v-if="showLogoutButton" type="text" icon="el-icon-switch-button" @click="logout">退出登录</el-button>
         </div>
       </header>
 
@@ -186,6 +186,7 @@ import xmpskNew from '../../components/pskModelExam/index.vue';
 import paperManagement from './cpns/PaperManagement.vue';
 import { createViolationGuard } from './violationGuard.js';
 import { examSession } from './examSession';
+import { assertExamCanSubmit } from './examSubmission';
 import { bindFullscreenChange, enterExamFullscreen, exitExamFullscreen, isExamFullscreen } from './examFullscreen';
 import { finishExam, getExamTime, getPaperDetail, getTempAnswer, logout as logoutRequest, submitExamSession, toPaperView, wgjl, yzmjy } from '@/api/pwgh/examCbPsk';
 
@@ -441,6 +442,10 @@ export default {
     isTheoryExamLocked() {
       return !this.isExaminer && !this.reviewMode
         && ((this.examAnswering && !this.scenarioExamActive) || this.hasActiveTheoryPaper);
+    },
+    showLogoutButton() {
+      if (this.isExaminer || this.reviewMode || this.mode || this.examClosedHandled || this.examExpiredHandled) return true;
+      return !this.examAnswering && !this.scenarioExamActive && !this.hasActiveTheoryPaper;
     },
     menuGroups() {
       if (this.isExaminer) return EXAMINER_MENUS;
@@ -937,10 +942,13 @@ export default {
       } catch (error) {
         answers = [];
       }
+      await assertExamCanSubmit(paperId);
       return submitExamSession({ paperId, answers });
     },
-    submitExamForViolation() {
-      return this.isScenarioExam() ? finishExam() : this.submitTheoryExam();
+    async submitExamForViolation() {
+      if (!this.isScenarioExam()) return this.submitTheoryExam();
+      await assertExamCanSubmit(localStorage.getItem('paperId'));
+      return finishExam();
     },
     banExamForViolation() {
       this.stopTheoryViolationGuard();
@@ -1031,7 +1039,7 @@ export default {
         : source;
       return value != null && String(value).trim() !== '';
     },
-    handleExamClosedByStatus() {
+    handleExamClosedByStatus(message = '考试已结束') {
       if (this.examClosedHandled || this.needLogin || this.isExaminer || this.reviewMode) return;
       this.examClosedHandled = true;
       if (this.timer) window.clearInterval(this.timer);
@@ -1039,12 +1047,12 @@ export default {
       this.theoryFullscreenGate = false;
       this.stopTheoryViolationGuard();
       exitExamFullscreen();
-      this.$confirm('考试已结束', '提示', {
+      return this.$confirm(message, '提示', {
         type: 'warning',
         confirmButtonText: '确认',
         showCancelButton: false
       }).catch(() => {}).finally(() => {
-        this.requestLogout({ silent: true });
+        return this.requestLogout({ silent: true });
       });
     },
     getExamTimeInfo(paperId) {
@@ -1109,6 +1117,7 @@ export default {
     finishKs() {
       this.$confirm('确定要提交试卷吗？提交后将结束考试，是否继续？', '提示', { type: 'warning' })
         .then(async () => {
+          await assertExamCanSubmit(localStorage.getItem('paperId'));
           await finishExam();
           const accountId = this.ksUserInfo.id || this.ksUserInfo.userId;
           if (accountId) await logoutRequest({ accountId });
@@ -1116,6 +1125,10 @@ export default {
           this.$message.success('提交成功，结束考试!');
         })
         .catch(error => {
+          if (error.code === 'EXAM_UNAVAILABLE') {
+            this.handleExamClosedByStatus(error.message);
+            return;
+          }
           if (error !== 'cancel' && error !== 'close') this.$message.error(error.message || '提交失败');
         });
     },
@@ -1309,6 +1322,17 @@ export default {
       if (this.examExpiredHandled) return;
       this.examExpiredHandled = true;
       try {
+        await assertExamCanSubmit(localStorage.getItem('paperId'));
+      } catch (error) {
+        this.examExpiredHandled = false;
+        if (error.code === 'EXAM_UNAVAILABLE') {
+          this.handleExamClosedByStatus(error.message);
+          return;
+        }
+        this.$message.error(error.message || '考试状态查询失败，请稍后重试');
+        return;
+      }
+      try {
         await finishExam();
         const accountId = this.currentUser.id || this.currentUser.userId || this.ksUserInfo.id || this.ksUserInfo.userId;
         if (accountId) await logoutRequest({ accountId });
@@ -1321,9 +1345,14 @@ export default {
     },
     async finishAndLogout() {
       try {
+        await assertExamCanSubmit(localStorage.getItem('paperId'));
         await finishExam();
         await this.requestLogout();
       } catch (error) {
+        if (error.code === 'EXAM_UNAVAILABLE') {
+          await this.handleExamClosedByStatus(error.message);
+          return;
+        }
         this.$message.error(error.message || '结束考试失败');
       }
     },

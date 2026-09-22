@@ -20,7 +20,7 @@
       <div class="action-group" aria-label="画布操作">
         <el-button class="btn" size="mini" @click="updateTopology" v-if="mode === '出题' && !isCurrentYear">更新</el-button>
         <el-button class="btn" size="mini" @click="saveTopology" v-if="mode !== '阅卷中' && !isCurrentYear">保存</el-button>
-        <el-button class="btn" size="mini" @click="clearTopology" v-if="mode !== '阅卷中' && !isCurrentYear">清空</el-button>
+        <!-- <el-button class="btn" size="mini" @click="clearTopology" v-if="mode !== '阅卷中' && !isCurrentYear">清空</el-button> -->
         <span v-if="saveMessage" class="save-message">{{ saveMessage }}</span>
       </div>
     </div>
@@ -2158,6 +2158,7 @@ export default {
     nodeLabelByType(type) {
       const labelMap = {
         breaker: '断路器',
+        'breaker-gh': '断路器-规划年',
         hw: 'HW',
         df: 'DF',
         kg: 'KG',
@@ -2472,6 +2473,7 @@ export default {
     defaultNodeName(type, index) {
       const nameMap = {
         breaker: '断路器',
+        'breaker-gh': '断路器-规划年',
         hw: '环网柜',
         df: '电缆分支箱',
         kg: '开闭所',
@@ -3354,7 +3356,8 @@ export default {
 }
 
 .year-pill.active {
-  box-shadow: inset 0 0 0 999px rgba(50, 74, 110, 0.12);
+  box-shadow: inset 0 0 0 999px rgb(197 219 251);
+  border-width: 2px;
 }
 
 .year-2025 {
@@ -3362,11 +3365,11 @@ export default {
 }
 
 .year-2026 {
-  color: #d94730;
+  color: #2f63d5;
 }
 
 .year-2027 {
-  color: #5a7340;
+  color: #d94730;
 }
 
 .year-2030 {
